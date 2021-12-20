@@ -1,0 +1,323 @@
+#!/usr/bin/Rscript
+
+REQS <- c('data.table',  'stringr','openxlsx', 'dplyr')
+REQS.missing <- REQS[!(REQS %in% installed.packages()[,"Package"])]
+if(length(REQS.missing)){
+  if(! interactive()){
+    stop(
+      paste0('The following required packages could not be found:\n',
+             paste0(REQS.missing, collapse = '\n'))
+    )
+  }
+
+  BiocManager::install(REQS.missing)
+}
+lapply(REQS, library, character.only=TRUE)
+
+args <- commandArgs(trailingOnly = TRUE)
+
+# Load in RData saved from first Rscript
+RDATA=args[[1]]
+
+##Reading in whether the script is associated with Mouse or Human
+SPECIES <- args[[2]]
+
+# Load in Chymera output file
+TEMP_DIR <- args[[3]]
+
+# Location to save the output data
+OUTPUT <- args[[4]]
+
+##Getting the guidescan score
+GS_Vidigal <- args[[5]]
+
+
+# # ChymeraScores <- data.table(read.delim(paste0(TEMP_DIR, '/scores.txt'), sep = '|', header = FALSE, skip = 1))
+# ChymeraScores <- fread(paste0(TEMP_DIR, '/scores.txt'), sep = '|', header = FALSE, skip = 1)
+ChymeraScores <- data.table()
+for (f in list.files(path=paste0(TEMP_DIR, '/ChymeraChunks/'), full.names=TRUE)) {
+    # print(paste0('Reading in file `', basename(f), '`...'))
+
+    chymeraTMP <- read.delim(f, sep = '|',header = FALSE, skip = 1)
+    ChymeraScores  <- rbind(ChymeraScores, as.data.table(chymeraTMP))
+}
+
+# Get colnames before splitting column V10 (ensures that "Score" will not be included)
+cols <- colnames(ChymeraScores)
+
+
+# Exclude first column (`chr` does not require splitting)
+cols <- cols[-1]
+
+ChymeraScores[, c("V10", "CNN") := tstrsplit(V10, "\t", fixed=TRUE)]
+
+
+# Function to split the values by first instance of '.'
+#   Returns only the second half of the split
+splitFun <- function(x) { str_split_fixed(x, '☤', n=2)[,2]; }
+
+cleanDT <- function(dt) {
+    dt <- dt[!(is.na(transcript_id) & is.na(exon_id) & is.na(exon_number))] 
+    for(aCol in list( c('exon_id', 'exon_number'), 'transcript_id', c('transcript_id', 'exon_id', 'exon_number') )) {
+        # Order data.table by `aCol` column, grouping NA's at top
+        setorderv(dt, aCol)
+
+        # Columns to compare to determine if row is duplicate
+        #   - contains every column excluding `aCol`
+        compCols <- setdiff(colnames(dt), aCol)
+
+        # Create subset of duplicate entries
+        toRM <- dt[duplicated(dt, by=compCols, fromLast=TRUE),]
+
+        # Filter `toRM` to only include rows where `aCol` is NA
+        for(bCol in aCol) {
+            toRM <- na.omit(toRM, cols=bCol, invert=TRUE)
+        }
+
+        # Remove entries from `dt` that are present in table `toRM`
+        dt <- fsetdiff(dt, toRM)
+    }
+
+    return(dt)
+}
+
+
+# Apply `splitFun` to all columns in array `cols`
+ChymeraScores[, (cols) := lapply(.SD, splitFun), .SDcols=cols]
+
+colnames(ChymeraScores) <- c("seqnames", "strand", "pam_start" ,"pam_end", "guideseq_start", "guideseq_end",
+                               "guide_seq", "cut_start", "cut_end", "gtf_overlapping_gene_id", "CNN")
+
+
+
+ChymeraScores[, pam_start := as.integer(pam_start)]
+ChymeraScores[, pam_end := as.integer(pam_end)]
+ChymeraScores[, guideseq_start := as.integer(guideseq_start)]
+ChymeraScores[, guideseq_end := as.integer(guideseq_end)]
+ChymeraScores[, cut_start := as.integer(cut_start)]
+ChymeraScores[, cut_end := as.integer(cut_end)]
+
+
+
+# Load `cas12_FullList` from RData file
+load(RDATA)
+cas12_FullList_bak <- copy(cas12_FullList)
+cas12_FullList <- cleanDT(cas12_FullList)
+
+Cas12_Chimera_Merged <- merge(cas12_FullList, ChymeraScores,
+                                by = c("seqnames", "strand", "pam_start", "pam_end", "gtf_overlapping_gene_id",
+                                        "guideseq_start", "guideseq_end", "guide_seq", "cut_start", "cut_end"),
+                                all.x = TRUE)
+
+# Delete variables to free up space
+rm(cas12_FullList, ChymeraScores,cas12_FullList_bak )
+
+
+# Reading the Guide Scan file
+Guidee_scan <- read.table(GS_Vidigal , header = FALSE )
+colnames(Guidee_scan) <- c("TargetSequence" , "Specifity_Score" , "Hamming 0", "Hamming 1", "Hamming 2", "Hamming 3")
+
+
+
+#Extracting the last 23 sequence and creating a new column
+
+Guidee_scan$guide_seq <- substring(Guidee_scan$TargetSequence, 5, 27)
+
+
+
+Cas12_Chimera_GuidScan_Merged <- merge(Cas12_Chimera_Merged, Guidee_scan,
+                                        by= "guide_seq",
+                                        all.x = TRUE)
+
+                                        
+
+Cas12_Chimera_GuidScan_Merged <- unique(Cas12_Chimera_GuidScan_Merged)
+
+
+Cas12_Chimera_GuidScan_Merged_csv <- Cas12_Chimera_GuidScan_Merged[, c( "seqnames",
+                                                                        "strand",
+                                                                        "guideseq_start",
+                                                                        "guideseq_end",
+                                                                        "guide_seq",
+                                                                        "cut_start",
+                                                                        "cut_end",
+                                                                        "pam_seq",
+                                                                        "pam_start",
+                                                                        "pam_end",
+                                                                        "gtf_gene_name",
+                                                                        "gtf_overlapping_gene_id",
+                                                                        "gene_type",
+                                                                        "overlapping_exon",
+                                                                        "overlapping_intron",
+                                                                        "overlapping_UTR",
+                                                                        "overlapping_CDS",
+                                                                        "transcript_id",
+                                                                        "exon_id",
+                                                                        "exon_number",
+                                                                        "Overlapping_Gene",
+                                                                        
+                                                                        
+"Specifity_Score"  ,
+"Hamming 0",
+"Hamming 1"  ,
+"Hamming 2",
+"Hamming 3",                                                                      "CNN"
+                                                                       
+                                                                  )]
+
+
+colnames(Cas12_Chimera_GuidScan_Merged_csv) <-  c(  "chromosome",
+                                                    "strand",
+                                                    "guideseq_start",
+                                                    "guideseq_end",
+                                                    "guide_seq",
+                                                    "cut_start",
+                                                    "cut_end",
+                                                    "pam_seq",
+                                                    "pam_start",
+                                                    "pam_end",
+                                                    "gene_symbol",
+                                                    "gene_id",
+                                                    "gene_type",
+                                                    "overlapping_exon",
+                                                    "overlapping_intron",
+                                                    "overlapping_UTR",
+                                                    "overlapping_CDS",
+                                                    "transcript_id",
+                                                    "exon_id",
+                                                    "exon_number",
+                                                    "Overlapping_Gene",
+                                                    "Specifity_Score"  ,
+"Hamming 0",
+"Hamming 1"  ,
+"Hamming 2",
+"Hamming 3", 
+                                                    "CHyMErA_Net_score"
+                                                    
+
+                                                )
+
+
+
+
+Final_Merged <- Cas12_Chimera_GuidScan_Merged_csv
+
+
+###Getting those rows which are having no guide scores.
+Final_NA <- Final_Merged[is.na(Final_Merged$Specifity_Score),]
+
+###Getting those rows which are having no guide scores.
+Final_NotNA <- Final_Merged[!(is.na(Final_Merged$Specifity_Score)),]
+
+
+
+
+UniqueChr <- unique(Final_NotNA$chromosome)
+
+
+SubDir <- paste0(OUTPUT, '/Cas12_', SPECIES,'_new')
+
+if(dir.exists(OUTPUT) & (!dir.exists(SubDir ))) {
+  dir.create(SubDir, recursive = TRUE)
+}
+
+
+
+for (chr in UniqueChr){
+  SubSet1 <- unique(Final_NotNA[Final_NotNA$chromosome == chr,])
+  SubSet1 <- as.data.table(SubSet1)
+  SubSet <- cleanDT(SubSet1)
+  write.table(SubSet, file = paste0(SubDir,"/",  chr, "_Cas12.txt"), sep = "\t",
+              row.names = FALSE, col.names = TRUE)
+
+}
+
+#############################################################################################################
+
+
+
+
+Final_NA <- unique(Final_NA)
+
+write.table(Final_NA, file = paste0(SubDir,"/",  "NoGuideScores_Cas12.txt"), sep = "\t",
+            row.names = FALSE, col.names = TRUE)
+
+
+#############################################################################################################
+
+# Getting the total guides per chromasome in each file
+# also how many have missing chymera scores and GudeScan Scores
+
+
+ChymeraNullValuesLog <- data.frame()
+ChymeraNullValues <- data.frame()
+
+GuideScanLog <- data.frame()
+
+for (chr in UniqueChr){
+
+##Subsetting per chromosome from the df having the entire scores
+  SubSet <- NA
+  SubSet <- unique(Cas12_Chimera_GuidScan_Merged_csv[Cas12_Chimera_GuidScan_Merged_csv$chromosome %in% chr,])
+  TotalNullChymeraScores <- NA
+  TotalNullChymeraScores <- nrow(SubSet[is.na(SubSet$CHyMErA_Net_score),])
+  TotalObservation <- NA
+  TotalObservation <- nrow(SubSet)
+  ChymeraNullValuesLog <- rbind(ChymeraNullValuesLog, cbind(chr , "Total",   TotalObservation, TotalNullChymeraScores))
+  ChymeraNullValues <- rbind(ChymeraNullValues ,SubSet[is.na(SubSet$CHyMErA_Net_score),] )
+  Total <- NA
+  Total <- TotalObservation
+
+  ##Subsetting from individual file. We are saving the output of each chromosome into 2 files
+  ##1. one txt file for each chromosome
+  
+  ##2. one txt file NoGuideScores_Cas12.txt where there is no guidescan score in the guidescan file
+
+   ##Subsetting per chromosome from the df having the entire scores
+  SubSet <- NA
+  SubSet <- unique(Final_NotNA[Final_NotNA$chromosome %in% chr,])
+  TotalNullChymeraScores <- NA
+  TotalNullChymeraScores <- nrow(SubSet[is.na(SubSet$CHyMErA_Net_score),])
+  TotalObservation <- NA
+  TotalObservation <- nrow(SubSet)
+  ChymeraNullValuesLog <- rbind(ChymeraNullValuesLog, cbind(chr , "Missing_nt_GuideScan_Cas12.txt",   TotalObservation, TotalNullChymeraScores))
+  ObservationinMissing <- NA
+  ObservationinMissing <- TotalObservation
+
+  ##Subsetting per chromosome from the df having the entire scores
+  SubSet <- NA
+  SubSet <- unique(Final_NA[Final_NA$chromosome %in% chr,])
+  TotalNullChymeraScores <- NA
+  TotalNullChymeraScores <- nrow(SubSet[is.na(SubSet$CHyMErA_Net_score),])
+  TotalObservation <- NA
+  TotalObservation <- nrow(SubSet)
+  ChymeraNullValuesLog <- rbind(ChymeraNullValuesLog, cbind(chr , "NoGuideScores_Cas12.txt",      TotalObservation, TotalNullChymeraScores))
+  ObservationinNoGuideScores <- NA
+  ObservationinNoGuideScores <- TotalObservation
+
+  GuideScanLog <- rbind(GuideScanLog , cbind(chr,Total, ObservationinMissing, ObservationinNoGuideScores  ))
+
+}
+
+
+QA_Dir <- paste0(SubDir, '/QA/')
+if(!dir.exists(QA_Dir))
+    dir.create(QA_Dir)
+
+colnames(ChymeraNullValuesLog) <- c("chromosome", "File Name", "Total guides per chromosome" , "Number of guides with no Chymera Scores")
+
+write.table(ChymeraNullValuesLog, file = paste0(QA_Dir, "/ChymeraNullValuesLog.txt"), sep = "\t",
+            row.names = FALSE, col.names = TRUE)
+
+
+
+write.table(ChymeraNullValues, file = paste0(SubDir, "/MissingChymeraScores.txt"), sep = "\t",
+            row.names = FALSE, col.names = TRUE)
+
+colnames(GuideScanLog) <- c("chromosome", "Total number of guides" , "Numer of guides with guidescan score", "Number of guides with no Guidescan score")
+
+write.table(GuideScanLog, file = paste0(QA_Dir, "/Cas12_GuideScanLog.txt"), sep = "\t",
+            row.names = FALSE, col.names = TRUE)
+
+
+print("Done!!!!!!!!!!!")

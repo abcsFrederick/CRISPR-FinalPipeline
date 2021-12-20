@@ -1,0 +1,642 @@
+#!/usr/bin/Rscript
+
+###This script is for enzyme - Cas12
+
+##This script is getting the Cas12 guides for the entire human genome or Mouse genome depending upon the variable passed
+
+#This script takes into consideration the new request made by #client on Agust 20,2021
+
+#They requested us to rename "overlapping_gene_id" into "gene_id" #to clearly separate it from "Overlapping_Gene".
+
+#They also wanted to include "transcript ID".
+#Thet also wanted to collect the exon number targeted by a guide #for a given transcript (e.g. exon 1 or exon 12)?
+
+
+
+rm(list = ls())
+
+# If the host machine is a Windows platform, increase the memory limit.
+#  (this is not necessary on *nix platforms)
+if (Sys.info()[['sysname']] == 'Windows') {
+  memory.limit(150000)
+}
+
+
+# Parse commandline arguments:
+#   Extract script name from argument list:
+fullArgs <- commandArgs()
+me <- substring(fullArgs[grep("--file", fullArgs)], 8)
+me <- basename(me)
+
+USAGE <- paste0('USAGE:\n', me, '<species> <gtf_file> [output_directory]\n\n',
+            'Options for species: \'Human\' or \'Mouse\'',
+            'Note:\n',
+              '\tIf no output \`output_directory\` is provided, ",
+              "the parent directory of \`gtf_file\` will be used instead.'
+        )
+
+# Fetch only user-provided arguments:
+args <- commandArgs(trailingOnly = TRUE)
+
+# Input validation:
+if (length(args) < 2) {
+    stop("\nA species and input file must be propvided.\n\n", USAGE)
+    quit(save="no")
+}else if (length(args) > 3 ) {
+    stop("\nA maximum of 3 variables expected.\n\n", USAGE)
+    quit(save="no")
+} else if ((args[[1]] == '-h') || (args[[1]] == '--help')) {
+    writeLines(USAGE)
+    quit(save="no")
+}
+
+
+# Function to convert text to titlecase (taken from manual page for `tolower`)
+capwords <- function(s, strict = FALSE) {
+    cap <- function(s) paste(toupper(substring(s, 1, 1)),
+                    {s <- substring(s, 2); if(strict) tolower(s) else s},
+                    sep = "", collapse = " " )
+    sapply(strsplit(s, split = " "), cap, USE.NAMES = !is.null(names(s)))
+}
+
+
+
+SPECIES <- capwords(args[[1]])
+
+# @TODO: find way to auto-match `Genome` variable by parsing `GENCODE_GTF`
+if(SPECIES == "Human"){
+    Genome <- 'BSgenome.Hsapiens.UCSC.hg38'
+}else if(SPECIES == "Mouse"){
+    Genome <- 'BSgenome.Mmusculus.UCSC.mm10'
+}
+
+
+GENCODE_GTF <- args[[2]]
+
+if(!file_test("-f", GENCODE_GTF)){
+    stop("\nFile '", GENCODE_GTF, "' either does not exist or is not a file\n\n", USAGE)
+} else if((! endsWith(tolower(GENCODE_GTF), '.gtf.gz')) && (! endsWith(tolower(GENCODE_GTF), '.gtf')) ){
+  stop("\nInput file '", GENCODE_GTF, "' does not seem to be a GTF file.\n\n", USAGE)
+  quit(save="no")
+}
+
+# By default, set to same directory.
+DATA.OUT <- dirname(GENCODE_GTF)
+
+# If an output directory *has* been provided, use that instead
+if( length(args) == 3) {
+    DATA.OUT <- args[[3]]
+
+    if(!dir.exists(DATA.OUT)) {
+        if(! dir.exists(dirname(DATA.OUT)))
+            stop("\nPath '", DATA.OUT, "' either does not exist or is not a directory.\n\n", USAGE)
+
+        dir.create(DATA.OUT)
+    }
+}
+
+
+
+
+##Loading all the required libraries
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+
+
+
+REQS <- c(Genome, 'GenomicRanges', 'data.table', 'readr', 'tidyverse','openxlsx', 'tools')
+REQS.missing <- REQS[!(REQS %in% installed.packages()[,"Package"])]
+if(length(REQS.missing)){
+  if(! interactive()){
+    stop(
+      paste0('The following required packages could not be found:\n',
+             paste0(REQS.missing, collapse = '\n'))
+    )
+  }
+
+  BiocManager::install(REQS.missing)
+}
+lapply(REQS, library, character.only=TRUE)
+
+
+
+if(SPECIES == "Human"){
+    #loading human genome
+    genome <- BSgenome.Hsapiens.UCSC.hg38
+}else if(SPECIES == "Mouse"){
+    #loading Mouse genome
+    genome <- BSgenome.Mmusculus.UCSC.mm10
+}
+
+####seqlevels functions will show all the sequence names
+seqlevels(genome)
+
+cleanDT <- function(dt) {
+    dt <- dt[!(is.na(transcript_id) & is.na(exon_id) & is.na(exon_number))] 
+    for(aCol in list( c('exon_id', 'exon_number'), 'transcript_id', c('transcript_id', 'exon_id', 'exon_number') )) {
+        # Order data.table by `aCol` column, grouping NA's at top
+        setorderv(dt, aCol)
+
+        # Columns to compare to determine if row is duplicate
+        #   - contains every column excluding `aCol`
+        compCols <- setdiff(colnames(dt), aCol)
+
+        # Create subset of duplicate entries
+        toRM <- dt[duplicated(dt, by=compCols, fromLast=TRUE),]
+
+        # Filter `toRM` to only include rows where `aCol` is NA
+        for(bCol in aCol) {
+            toRM <- na.omit(toRM, cols=bCol, invert=TRUE)
+        }
+
+        # Remove entries from `dt` that are present in table `toRM`
+        dt <- fsetdiff(dt, toRM)
+    }
+
+    return(dt)
+}
+
+
+
+###########################################################################################
+###############Getting the positive sequences for CAs12a###################################
+###########################################################################################
+
+
+###Cas12 sequences are from 5'- TTTV (4nt PAM)  NNNNNNNNNNNNNNNNNNNNNNN (23nt guide) - 3'
+###The first 4 sequences are PAM sequences and it can be TTTA, TTTC and TTTG.
+#The rest 23 is guide sequences. Six sequences before PAM are the upstream sequences and ^
+##6 Sequences after the guide sequences are the down stream sequences.
+
+
+##Here we are matching pam sequences - "TTTA","TTTC","TTTG" with the sequences for the standard chromosomes
+##in the genome, so as to get that PAM co-ordinates.
+#From these PAM coordinates we are computing the rest of the co-ordinates.
+
+p1 <- DNAStringSet(c("TTTA","TTTC","TTTG"))
+
+# # make a vector with standard chromosome names
+chromosomes <- seqinfo(genome)
+chromosomes
+
+
+SpeciesLong <- ifelse(SPECIES == 'Human', "Homo sapiens", "Mus_musculus")
+
+#Keeping only the standard chromasomes
+chromosomes <- keepStandardChromosomes(chromosomes, species=SpeciesLong, pruning.mode = "tidy")
+seqlevels(chromosomes)
+
+
+###Matching the pam pattern(p1) with the genome
+pam_site <- vmatchPDict(p1, genome,max.mismatch=0)
+
+# subset by chromosome
+Cas12_pam_full <- pam_site[seqnames(pam_site) %in% seqnames(chromosomes)]
+
+
+##Subsetting by strands
+##Here we are getting only chr1. After completly automating this, we will process the entire chromasome
+# cas12_pam_sites_positive <- Cas12_pam_full[seqnames(Cas12_pam_full) %in% 'chr1' & strand(Cas12_pam_full) %in% "+"]
+
+cas12_pam_sites_positive <- Cas12_pam_full[strand(Cas12_pam_full) == "+"]
+
+# create a new column for PAM positions - PAM start and PAM end
+mcols(cas12_pam_sites_positive)$pam_start <- start(cas12_pam_sites_positive)
+mcols(cas12_pam_sites_positive)$pam_end <- end(cas12_pam_sites_positive)
+
+
+#computing the start and end from Pam Position. Cas12 guide sequence is 23 sequence long,
+##For positive strand the Pam sequence is before the guide sequence
+###For negative the PAM is after the guide sequence
+##So we have a total of 27 sequences
+
+# Getting the start and end position of the 27 sequences
+mcols(cas12_pam_sites_positive)$start_full_range <- start(cas12_pam_sites_positive)##Start = Pam start
+mcols(cas12_pam_sites_positive)$end_full_range <- start(cas12_pam_sites_positive) + 26### end = Pam start + 26
+cas12_pam_sites_positive
+
+# make a new GRanges Object with the new starts and ends
+
+overlapping_cas12_positive_strand_granges <- GRanges(seqnames = seqnames(cas12_pam_sites_positive),
+                                     IRanges(start = cas12_pam_sites_positive$start_full_range, end = cas12_pam_sites_positive$end_full_range),
+                                     strand = strand(cas12_pam_sites_positive))
+overlapping_cas12_positive_strand_granges
+
+#rm(list=setdiff(ls(), c("overlapping_cas12_positive_strand_granges","cas12_pam_sites_positive",  "genome", "pam_site", "chromosomes", "GENCODE_GTF", "DATA.OUT", "SPECIES")))
+
+
+#
+
+##Computing columns Pam start, Pam end. Pam is the first 4 sequences and then 23 guide sequence
+mcols(overlapping_cas12_positive_strand_granges)$pam_start <- start(overlapping_cas12_positive_strand_granges)
+mcols(overlapping_cas12_positive_strand_granges)$pam_end <- start(overlapping_cas12_positive_strand_granges) + 3
+
+
+# # getting guide seq start, guide seq end and guide seq ranges positions. Guide seq start is the 5 th sequence.
+mcols(overlapping_cas12_positive_strand_granges)$guideseq_start <- start(overlapping_cas12_positive_strand_granges) + 4
+mcols(overlapping_cas12_positive_strand_granges)$guideseq_end <- start(overlapping_cas12_positive_strand_granges) + 26
+
+
+# Computing the Pam Ranges and getting the Pam sequences
+pamseq_positive <- narrow(overlapping_cas12_positive_strand_granges, start = 1,end = 4)
+mcols(overlapping_cas12_positive_strand_granges)$pam_seq <- getSeq(genome, pamseq_positive)
+
+# Computing the guide Ranges and getting the guide sequences
+guide_positive <- narrow(overlapping_cas12_positive_strand_granges, start = 5, end = 27)
+mcols(overlapping_cas12_positive_strand_granges)$guide_seq <- getSeq(genome, guide_positive)
+
+###Computing the upstream start, upstream end and upstream sequences
+##Upstream sequences is the six sequences before Pam, so upstream start will be pam start - 6 and upstream end
+##will be pam start - 1
+#mcols(overlapping_cas12_positive_strand_granges)$upstream_start <- overlapping_cas12_positive_strand_granges$pam_start- 6
+#mcols(overlapping_cas12_positive_strand_granges)$upstream_end <- overlapping_cas12_positive_strand_granges$pam_start - 1
+
+##downstream sequences is the six sequences after the guide sequence, so downstream start will be guide seq end + 1 and downstream end
+##will be guide seq end + 6
+#mcols(overlapping_cas12_positive_strand_granges)$downstream_start <- overlapping_cas12_positive_strand_granges$guideseq_end + 1
+#mcols(overlapping_cas12_positive_strand_granges)$downstream_end <- overlapping_cas12_positive_strand_granges$guideseq_end + 6
+
+##Getting the position i.e., the start and end of the entire 39 sequence
+mcols(overlapping_cas12_positive_strand_granges)$input_start <- overlapping_cas12_positive_strand_granges$pam_start- 6
+mcols(overlapping_cas12_positive_strand_granges)$input_end <- overlapping_cas12_positive_strand_granges$guideseq_end + 6
+
+###For Cas12 the cutsite is between position 19 and 20, so it gets everything after 19
+mcols(overlapping_cas12_positive_strand_granges)$cut_start <- overlapping_cas12_positive_strand_granges$guideseq_start + 19
+mcols(overlapping_cas12_positive_strand_granges)$cut_end <- overlapping_cas12_positive_strand_granges$guideseq_start + 22
+
+
+##Converting the granges to dataframe for getting the upstream and down stream sequences
+overlapping_cas12_positive_strand_df  <- as.data.frame(overlapping_cas12_positive_strand_granges)
+
+## extracting the Full 39 Sequence for the Positive Strand
+Fullstream_positive <- makeGRangesFromDataFrame(overlapping_cas12_positive_strand_df[, c("seqnames", "strand", "input_start", "input_end")])
+
+overlapping_cas12_positive_strand_granges$CHyMErA_Net_input <- getSeq(genome, Fullstream_positive)
+#
+
+###########################################################################################
+###############Getting the negative sequences for CAs12a ###################################
+###########################################################################################
+#rm(list=setdiff(ls(), c("genome", "overlapping_cas12_positive_strand_granges","pam_site", "chromosomes", "GENCODE_GTF", "DATA.OUT", "SPECIES")))
+
+
+
+###For getting the cas12 guide sequence sitting on the negative strand, that PAM motif should be TAAA","GAAA","CAAA
+#on the +ve strand. So we are matching these sequence on the +ve strand and extracting the 23 sequence before the PAM motif
+#We also need to reverse complement to get the correct output representing the -strand sequence info
+
+p2 <- DNAStringSet(c("TAAA","GAAA","CAAA"))
+
+###Matching the pam pattern(p2) with the genome
+pam_site_neg <- vmatchPDict(p2, genome,max.mismatch=0)
+
+
+# subset for by chromosome
+cas12_pam_sites_neg <- pam_site_neg[seqnames(pam_site_neg) %in% seqnames(chromosomes)]
+
+###Making the seq levels to the standard chromosomes
+#seqlevels(cas12_pam_sites_neg) <- seqlevels(chromosomes)
+
+
+##Subsetting by strands
+cas12_pam_sites_neg <- cas12_pam_sites_neg[strand(cas12_pam_sites_neg) %in% "+"]
+# cas12_pam_sites_neg <- cas12_pam_sites_neg[seqnames(cas12_pam_sites_neg) %in% 'chr1' & strand(cas12_pam_sites_neg) %in% "+"]
+
+
+# create a new column for PAM positions
+mcols(cas12_pam_sites_neg)$pam_start <- start(cas12_pam_sites_neg)
+mcols(cas12_pam_sites_neg)$pam_end <- end(cas12_pam_sites_neg)
+
+# Getting the start and end position of the 27 sequences
+mcols(cas12_pam_sites_neg)$start_full_range <- end(cas12_pam_sites_neg) - 26
+mcols(cas12_pam_sites_neg)$end_full_range <- end(cas12_pam_sites_neg)
+
+#computing the start and end co-ordinates for the entire Cas12 guides from the already extracted Pam Positions
+##We are observing the negative starnd in 5` to 3` direction and then reverse complementing it.
+
+
+# make a new GRanges Object with the new starts and ends
+overlapping_cas12_negative_strand_granges <- GRanges(seqnames = seqnames(cas12_pam_sites_neg),
+                                     IRanges(start = cas12_pam_sites_neg$start_full_range, end = cas12_pam_sites_neg$end_full_range),
+                                     strand = strand(cas12_pam_sites_neg))
+overlapping_cas12_negative_strand_granges
+
+
+
+
+# #Adding the Pam start, Pam end. Pam sequence is the last 4 sequences
+mcols(overlapping_cas12_negative_strand_granges)$pam_start <- end(overlapping_cas12_negative_strand_granges) - 3
+mcols(overlapping_cas12_negative_strand_granges)$pam_end <- end(overlapping_cas12_negative_strand_granges)
+
+
+
+
+# # getting guide seq start, guide seq end and guide seq ranges positions. Guide seq start is the 5 th sequence.
+mcols(overlapping_cas12_negative_strand_granges)$guideseq_start <- start(overlapping_cas12_negative_strand_granges)
+mcols(overlapping_cas12_negative_strand_granges)$guideseq_end <- start(overlapping_cas12_negative_strand_granges) + 22
+
+
+
+
+
+# Computing the Pam Ranges and getting the Pam sequences
+pamseq_negative <- narrow(overlapping_cas12_negative_strand_granges, start = 24,end = 27)
+mcols(overlapping_cas12_negative_strand_granges)$pam_seq <- reverseComplement(getSeq(genome, pamseq_negative))
+
+# Computing the guide Ranges and getting the guide sequences
+# getting guide seq positions
+guide_negative <- narrow(overlapping_cas12_negative_strand_granges, start = 1, end = 23)
+mcols(overlapping_cas12_negative_strand_granges)$guide_seq <- reverseComplement(getSeq(genome, guide_negative))
+
+###Computing the upstream start, upstream end and upstream sequences
+
+##Upstream sequences is the six sequences at the beginning
+##will be pam start - 1
+#mcols(overlapping_cas12_negative_strand_granges)$upstream_start <- overlapping_cas12_negative_strand_granges$pam_end + 1
+
+#mcols(overlapping_cas12_negative_strand_granges)$upstream_end <- overlapping_cas12_negative_strand_granges$pam_end + 6
+
+
+##downstream sequences is the six sequences at the end
+#mcols(overlapping_cas12_negative_strand_granges)$downstream_start <- overlapping_cas12_negative_strand_granges$guideseq_start- 6
+#mcols(overlapping_cas12_negative_strand_granges)$downstream_end <-  overlapping_cas12_negative_strand_granges$guideseq_start - 1
+
+##Getting the position i.e., the start and end of the entire 39 sequence
+mcols(overlapping_cas12_negative_strand_granges)$input_start <- overlapping_cas12_negative_strand_granges$guideseq_start- 6
+mcols(overlapping_cas12_negative_strand_granges)$input_end <- overlapping_cas12_negative_strand_granges$pam_end + 6
+
+mcols(overlapping_cas12_negative_strand_granges)$cut_start <- overlapping_cas12_negative_strand_granges$guideseq_start
+mcols(overlapping_cas12_negative_strand_granges)$cut_end <- overlapping_cas12_negative_strand_granges$guideseq_start + 3
+
+
+##Converting the granges to dataframe for getting the upstream and down stream sequences
+overlapping_cas12_negative_strand_df  <- as.data.frame(overlapping_cas12_negative_strand_granges)
+
+
+
+## extracting the Full 39 Sequence for the negative Strand
+Fullstream_negative <- makeGRangesFromDataFrame(overlapping_cas12_negative_strand_df[, c("seqnames", "strand", "input_start", "input_end")])
+mcols(overlapping_cas12_negative_strand_granges)$Fullstream_seq <- getSeq(genome, Fullstream_negative)
+
+#cutstream_negative <- makeGRangesFromDataFrame(overlapping_cas12_negative_strand_df[, c("seqnames", "strand", "cut_start", "cut_end")])
+#mcols(overlapping_cas12_negative_strand_granges)$cut_seq <- reverseComplement(getSeq(genome, cutstream_negative))
+
+overlapping_cas12_negative_strand_granges$CHyMErA_Net_input <- reverseComplement(overlapping_cas12_negative_strand_granges$Fullstream_seq)
+strand(overlapping_cas12_negative_strand_granges) <- "-"
+
+mcols(overlapping_cas12_negative_strand_granges)$Fullstream_seq <- NULL
+
+#rm(list=setdiff(ls(), c("genome", "overlapping_cas12_positive_strand_granges", "overlapping_cas12_negative_strand_granges",
+#                        "pam_site", "chromosomes","pam_site_neg", "GENCODE_GTF", "DATA.OUT", "SPECIES"
+#                        )))
+
+#combining the Positive and Negative
+gene_list_cas12 <- c(overlapping_cas12_positive_strand_granges, overlapping_cas12_negative_strand_granges)
+
+#gene_list_cas12 <- gene_list_cas12_Full
+
+
+
+gene_list_cas12_df <- as.data.frame(gene_list_cas12, row.names = NULL)
+
+###Making cut start and cut end as the start and end########
+gene_list_cas12_df$start <- gene_list_cas12_df$cut_start
+gene_list_cas12_df$end <- gene_list_cas12_df$cut_end
+
+
+gene_list_cas12 <- makeGRangesFromDataFrame(gene_list_cas12_df, keep.extra.columns=TRUE)
+
+
+
+#we are loading the basic gene annotation file
+
+gtf <- rtracklayer::import(GENCODE_GTF)
+
+#converting the gtf file into the data frame
+gtf_df <- as.data.frame(gtf)
+
+
+#Subsetting the columns that we are interested in
+gtf_df <- gtf_df[, c("seqnames", "start", "end", "strand", "type", "gene_type", "gene_id", "gene_name", "transcript_id", "exon_number" ,"exon_id")]
+
+
+#renaming the columns and matching them to the column names client requested
+colnames(gtf_df) <- c("seqnames", "start", "end", "strand", "type", "gene_type", "gtf_overlapping_gene_id", "gtf_gene_name", "transcript_id","exon_number" , "exon_id")
+
+#making gene ranges from the gtf file
+gtf_granges <- makeGRangesFromDataFrame(gtf_df, keep.extra.columns = TRUE)
+
+
+########################################################################################
+##########################################################################################y
+###################### Finding the overlaps with exons, CDS, and UTR ######################
+##########################################################################################
+#making gene ranges from gene_list_cas12
+#gene_list_cas12_df <- as.data.frame(gene_list_cas12, row.names = NULL)
+
+#getting the regions of intersection between overlapping ranges in gene_list_cas12 and gtf file generated by hits
+hits <- findOverlaps(gene_list_cas12, gtf_granges, ignore.strand = TRUE )
+# hits
+
+# overlapping cut sites
+cas12_cutsite_overlapping <- cbind(gene_list_cas12_df[queryHits(hits),], gtf_df[subjectHits(hits),])
+
+
+##Changing the column names
+cas12_cutsite_overlapping <- cas12_cutsite_overlapping[,c(
+                                                          "seqnames",
+                                                          "strand",
+                                                          "pam_start",
+                                                          "pam_end",
+                                                          "guideseq_start",
+                                                          "guideseq_end",
+                                                          "pam_seq",
+                                                          "guide_seq",
+                                                          #"upstream_start",
+                                                          #"upstream_end",
+                                                          #"downstream_start",
+                                                          #"downstream_end",
+                                                          "input_start",
+                                                          "input_end",
+                                                          "cut_start",
+                                                          "cut_end",
+                                                          #"upstream_seq",
+                                                          #"downstream_seq",
+                                                          #"Fullstream_seq",
+                                                          #"cut_seq",
+                                                          "CHyMErA_Net_input",
+                                                          "type",
+                                                          "gene_type",
+                                                          "gtf_overlapping_gene_id",
+                                                          "gtf_gene_name",
+                                                          "transcript_id",
+                                                          "exon_id",
+                                                          "exon_number"
+                                                        )]
+
+#rm(list=setdiff(ls(), c( "genome",  "Genelist_data", "gene_list_cas12_df", "gtf_df", "cas12_cutsite_overlapping","DTcas12", "GENCODE_GTF", "DATA.OUT", "SPECIES")))
+
+
+cas12_overlapping <- as.data.table(cas12_cutsite_overlapping)
+# dim(cas12_overlapping)
+
+cas12_overlapping <- unique(cas12_overlapping)
+# dim(cas12_overlapping)
+
+
+
+#Clients want to capture overlapping_exon, overlapping_intron, overlapping_UTR and overlapping_CDS.
+
+# overlapping_exon will be TRUE if there is any instance of UTR or CDS or exon in feature for each unique combination of 'seqnames', 'cut_start', 'cut_end','strand' and 'gtf_gene_name'
+# overlapping_intron will be TRUE if there is intron in type for each unique combination of 'seqnames', 'cut_start', 'cut_end','strand' and 'gtf_gene_name'
+# overlapping_CDS will be TRUE if there is CDS in type for each unique combination of 'seqnames', 'cut_start', 'cut_end','strand' and 'gtf_gene_name'
+# overlapping_UTR will be TRUE if there is UTR in type for each unique combination of 'seqnames', 'cut_start', 'cut_end','strand' and 'gtf_gene_name'
+
+#To compute the overlapping_exon, overlapping_intron, #overlapping_UTR and overlapping_CDS - first we will create a column "feature" and then populate it with intron/exon/CDS/UTR after grouping by seqnames, cut_start, cut_end,strand , gtf_gene_name and #transcript_id.
+
+##Converting to a datatable and grouping by 'seqnames', 'cut_start', 'cut_end','strand', 'gtf_gene_name','transcript_id'
+
+DTcas12 <- as.data.table(cas12_overlapping, key=c('seqnames', 'cut_start', 'cut_end','strand', 'gtf_gene_name','transcript_id'))
+
+#For each unique 'seqnames', 'cut_start', 'cut_end','strand', 'gtf_gene_name' and 'transcript_id'
+# if there is "transcript" and "exon" and "CDS"in "type" then we populated "feature" with "CDS"
+# if there is "transcript" and "exon" and "UTR" in "type" then we populated "feature" with "UTR"
+# if there is only "transcript" and "exon then we populated in "type" "feature" with "exon"
+# if there is only transcript we populated in "type" then we populated "feature" with "intron"
+
+
+###Creating a column feature and populating that with "UTR", "CDS" , "exon" or "intron"
+DTcas12[,feature:= ifelse((('transcript' %in% type)  & ('UTR' %in% type) & ('CDS' %in% type)),'UTR-CDS',
+                          ifelse((('transcript' %in% type)  & ('UTR' %in% type)),'UTR',
+                                 ifelse((('transcript' %in% type) & ('CDS' %in% type)), 'CDS',
+                                        ifelse((('transcript' %in% type) & ('exon' %in% type)), 'exon',
+                                               ifelse((('transcript' %in% type)), 'intron',   "NA"))))),
+            by=c('seqnames', 'cut_start', 'cut_end','strand', 'gtf_gene_name', 'transcript_id') 
+        ]
+
+
+
+DTcas12$type <- NULL
+
+
+
+##Creating columns overlapping_exon, overlapping_intron, overlapping_UTR and overlapping_CDS.
+
+geneDT <- data.table(DTcas12, key=c('seqnames', 'cut_start', 'cut_end', 'gtf_gene_name'))
+geneDT[, overlapping_exon:=(('UTR' %in% feature) | ('CDS' %in% feature) | ('UTR-CDS' %in% feature) | ('exon' %in% feature)), by=c('seqnames', 'cut_start', 'cut_end','gtf_gene_name')]
+geneDT[, overlapping_intron:=('intron' %in% feature), by=c('seqnames', 'cut_start', 'cut_end','gtf_gene_name')]
+geneDT[, overlapping_UTR:=(('UTR' %in% feature) | ('UTR-CDS' %in% feature)), by=c('seqnames', 'cut_start', 'cut_end','gtf_gene_name')]
+geneDT[, overlapping_CDS:= (('CDS' %in% feature) | ('UTR-CDS' %in% feature)), by=c('seqnames', 'cut_start', 'cut_end', 'gtf_gene_name')]
+
+
+#geneDT$feature <- NULL
+
+
+cas12_Full <- unique(geneDT)
+
+###We need to remove additional rows having NA as exon id for the same guides. This is populated when there is
+###gene and transcript in type column. We cannot simply delete those rows having "NA's" in exon id fileld as when "intron" is TRUE
+##exon id will be "NA"
+
+# In our dataset, we need:
+#
+# 1. The rows/observations where "overlapping_exon" is TRUE  and there is "exon_id" and "overlapping_intron" is FALSE
+# 2. The rows/observations where "overlapping_exon" is TRUE  and there is "exon_id" and "overlapping_intron" is TRUE
+# 3. The rows/observations where "overlapping_exon" is FALSE and "overlapping_intron" is TRUE  and there is NA in "exon_id"
+# 4. There is also observations where overlapping_exon is TRUE without "exon_id" we will keep them too
+# So, we need to delete from our dataset
+
+#
+# The rows/observations where "overlapping_exon" is TRUE and "overlapping_intron" is FALSE and there is "NA" in  "exon_id"
+# The rows/observations where "overlapping_exon" is TRUE and "overlapping_intron" is TRUE  and there is "NA" in  "exon_id"
+
+#make a more explicit copy of a variable.
+cas12_FullList <- copy(cas12_Full)
+
+cas12_FullList <- cleanDT(cas12_FullList)
+
+# Order data.table by `exon_id` column, grouping NA's at top
+#setorderv(cas12_FullList, "exon_id")
+
+
+# Create subset of duplicate entries,
+#toRM <- cas12_FullList[duplicated(cas12_FullList,
+#                             by=c("seqnames", "strand", "pam_start", #"pam_end"#, "guideseq_start",
+#                                  "guideseq_end", "pam_seq", "cut_start", #"cut_end", "gene_type",
+#                                  "gtf_overlapping_gene_id", "transcript_id"
+#                              ),
+#                             fromLast=TRUE),]
+
+# Only remove duplicates where `exon_id` is NA
+#toRM <- toRM[is.na(exon_id) ]
+
+# Remove entries from `cas12_FullList` that are present in table `toRM`
+#cas12_FullList <- fsetdiff(cas12_FullList, toRM)
+
+##Creating a column Overlapping_Gene in which guides that overlap multiple genes are flagged (i.e. TRUE/FALSE depending on whether a guide is associated with more than one gene name
+
+cols <- c("seqnames", "cut_start", "cut_end","strand")
+
+cas12_FullList <- cas12_FullList%>%
+    group_by(across(all_of(cols))) %>%
+    mutate(count_all = n_distinct(gtf_gene_name))
+
+cas12_FullList <- data.table(cas12_FullList)
+
+cas12_FullList[,Overlapping_Gene := (count_all > 1) ]
+
+cas12_FullList$count_all <- NULL
+cas12_FullList <- unique(cas12_FullList)
+
+cas12_FullList_ForRunningChymera <- cas12_FullList[,c("seqnames",
+                                                      "strand",
+                                                      "pam_start",
+                                                      "pam_end",
+                                                      "guideseq_start",
+                                                      "guideseq_end",
+                                                      "guide_seq",
+                                                      "cut_start",
+                                                      "cut_end",
+                                                      "gtf_overlapping_gene_id",
+                                                      "CHyMErA_Net_input"
+                                                    )]
+
+cas12_FullList_ForRunningChymera <- unique(cas12_FullList_ForRunningChymera)
+
+head(cas12_FullList_ForRunningChymera)
+
+fastaDir <- paste0(DATA.OUT, "/cas12_", SPECIES, "__Fullgtf_Chymera_FASTA")
+if(!dir.exists(fastaDir))
+    dir.create(fastaDir)
+
+for(chr in cas12_FullList_ForRunningChymera[,unique(seqnames)]) {
+    cas12_Chr <- cas12_FullList_ForRunningChymera[seqnames == chr]
+
+    # Should we just remove the text before the '☤'??????
+    FASTA <- paste0('>',                        cas12_Chr$seqnames,
+                    '|strand☤',                 cas12_Chr$strand,
+                    '|pam_start☤',              cas12_Chr$pam_start,
+                    '|pam_end☤',                cas12_Chr$pam_end,
+                    '|guideseq_start☤',         cas12_Chr$guideseq_start,
+                    '|guideseq_end☤',           cas12_Chr$guideseq_end,
+                    '|guide_seq☤',              cas12_Chr$guide_seq,
+                    '|cut_start☤',              cas12_Chr$cut_start,
+                    '|cut_end☤',                cas12_Chr$cut_end,
+                    '|gtf_overlapping_gene_id☤',cas12_Chr$gtf_overlapping_gene_id,
+                    '\n',                       cas12_Chr$CHyMErA_Net_input
+    )
+
+    fastaFile <- paste0(fastaDir, '/', chr, '.fasta')
+    fileConn <- file(fastaFile)
+    writeLines(FASTA, fileConn)
+    close(fileConn)
+}
+
+
+RdataFile <- paste0(DATA.OUT, "/cas12_FullList_", SPECIES, ".RData")
+save(cas12_FullList, file=RdataFile)
+
+# Additional string at front adds '☤' delimiter to mark start of return values
+#   (Additional R output caused parsing issues during testing)
+cat(paste('Return Values:', fastaDir, RdataFile, sep='☤'))
