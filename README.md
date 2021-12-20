@@ -51,7 +51,7 @@ This will merge all the files that we created and also the guide scan scores the
     
     /mnt/CSS-Statistics/CRISPR/Cas12-GuideScan/Cas12a_hg38_ennumerations.txt. <br />
 
-    This script will save the final file in the output folder specified in Argument 4.
+This script will save the final file in the output folder specified in Argument 4.
 
 
 
