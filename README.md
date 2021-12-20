@@ -47,7 +47,9 @@ This will merge all the files that we created and also the guide scan scores the
 <li> Argument 3: The folder where we have the chymera scores. </li>
 <li> Argument 4: The folder where we need to save the output. </li>
 <li> Argument 5: The txt file from the vidigal group having the guidescan scores. </li>
-               The file is saved in folder /mnt/CSS-Statistics/CRISPR/Cas12-GuideScan/Cas12a_hg38_ennumerations.txt. <br />
+ The guidescan score is saved in folder
+    
+    /mnt/CSS-Statistics/CRISPR/Cas12-GuideScan/Cas12a_hg38_ennumerations.txt. <br />
 
     This script will save the final file in the output folder specified in Argument 4.
 
